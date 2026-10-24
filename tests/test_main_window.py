@@ -7,13 +7,17 @@ import time
 import pytest
 from PyQt5.QtCore import Qt, QProcess, QTimer
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication, QPushButton, QFileDialog, QMessageBox
+from PyQt5.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QInputDialog, QLineEdit, QMessageBox, QPushButton,
+)
 
 from ros2_control_center import app as application
 from ros2_control_center.main_window import MainWindow, ToolCard
 from ros2_control_center.process_manager import ProcessManager, ProcessState
 from ros2_control_center.ros_graph import GraphKind, GraphResult, RosGraphWorker
 from ros2_control_center.workspace import WorkspaceManager
+from ros2_control_center.guided_workflow import RecentWorkspaces, PackageInfo
 
 
 @pytest.fixture(scope='session')
@@ -55,8 +59,9 @@ def manager(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def window(qt_app, manager):
-    instance = MainWindow(manager=manager)
+def window(qt_app, manager, tmp_path):
+    instance = MainWindow(manager=manager,
+                          recent_workspaces=RecentWorkspaces(tmp_path / 'workspaces.json'))
     instance.show()
     qt_app.processEvents()
     yield instance
@@ -257,7 +262,8 @@ def test_workspace_open_build_launch_exact_manager_commands(qt_app, manager, tmp
     launched = []
     target = tmp_path / 'ws with spaces; $(touch nope)'
     WorkspaceManager.create(target)
-    instance = MainWindow(manager=manager, command_launcher=lambda argv: launched.append(argv) or True)
+    instance = MainWindow(manager=manager, command_launcher=lambda argv: launched.append(argv) or True,
+                          recent_workspaces=RecentWorkspaces(tmp_path / 'workspaces.json'))
     try:
         instance.workspace_path.setText(str(target))
         instance.open_button.click()
@@ -274,7 +280,8 @@ def test_workspace_open_build_launch_exact_manager_commands(qt_app, manager, tmp
 def test_workspace_external_launcher_failure_is_visible(qt_app, manager, tmp_path):
     target = tmp_path / 'ready'
     WorkspaceManager.create(target)
-    instance = MainWindow(manager=manager, command_launcher=lambda argv: False)
+    instance = MainWindow(manager=manager, command_launcher=lambda argv: False,
+                          recent_workspaces=RecentWorkspaces(tmp_path / 'workspaces.json'))
     try:
         instance.workspace_path.setText(str(target))
         instance.build_button.click()
@@ -294,6 +301,146 @@ def test_browse_changes_workspace_path_and_log_folder_uses_state_dir(window, mon
                         lambda url: opened.append(url.toLocalFile()) or True)
     window.log_folder_button.click()
     assert opened == [str(window.manager.state_dir)]
+
+
+def test_named_folder_dialog_and_workspace_switch_keep_locations_separate(window, monkeypatch, tmp_path):
+    first = tmp_path / 'first_ws'
+    second = tmp_path / 'second_ws'
+    for workspace in (first, second):
+        window.workspace_path.setText(str(workspace))
+        window.create_button.click()
+    assert [Path(window.recent_workspace_combo.itemData(i))
+            for i in range(1, window.recent_workspace_combo.count())] == [second, first]
+
+    window.recent_workspace_combo.activated.emit(2)
+    assert window.workspace_path.text() == str(first)
+    assert window.code_folder == first / 'src'
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *args: ('robot_code', True))
+    window.create_folder_button.click()
+    assert (first / 'src' / 'robot_code').is_dir()
+    assert window.code_folder == first / 'src' / 'robot_code'
+
+    monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *args: str(first / 'src'))
+    window.choose_code_folder_button.click()
+    assert window.code_folder == first / 'src'
+    window.recent_workspace_combo.activated.emit(1)
+    assert window.workspace_path.text() == str(second)
+    assert window.code_folder == second / 'src'
+    assert not (second / 'src' / 'robot_code').exists()
+
+
+def test_new_workspace_name_dialog_creates_separate_workspace(window, monkeypatch, tmp_path):
+    window.workspace_path.setText(str(tmp_path / 'placeholder_ws'))
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *args: ('新项目 ws', True))
+    window.new_workspace_button.click()
+    target = tmp_path / '新项目 ws'
+    assert window.workspace_path.text() == str(target)
+    assert (target / 'src').is_dir()
+    assert window.code_folder == target / 'src'
+
+
+def test_package_dialog_opens_code_builds_and_runs_selected_node(qt_app, manager, monkeypatch, tmp_path):
+    launched = []
+    instance = MainWindow(
+        manager=manager, command_launcher=lambda argv: launched.append(argv) or True,
+        recent_workspaces=RecentWorkspaces(tmp_path / 'workspaces.json'),
+    )
+    workspace = tmp_path / 'guided_ws'
+    packages = []
+
+    def fake_create(path, name, language, folder, dependencies):
+        assert (path, name, language, folder, dependencies) == (
+            workspace, 'my_robot', 'cpp', workspace / 'src', ('std_msgs',))
+        package_dir = folder / name
+        source = package_dir / 'src' / 'hello_node.cpp'
+        source.parent.mkdir(parents=True)
+        source.write_text('int main() {}', encoding='utf-8')
+        info = PackageInfo(name, 'ament_cmake', package_dir, source, 'hello_node')
+        packages.append(info)
+        return info
+
+    def accept_create_dialog(dialog):
+        name = next(widget for widget in dialog.findChildren(QLineEdit)
+                    if widget.accessibleName() == '新功能包名称')
+        name.setText('my_robot')
+        language = next(widget for widget in dialog.findChildren(QComboBox)
+                        if widget.accessibleName() == '功能包编写语言')
+        language.setCurrentIndex(1)
+        next(widget for widget in dialog.findChildren(QCheckBox)
+             if widget.accessibleName() == '导入 std_msgs').setChecked(True)
+        return QDialog.Accepted
+
+    monkeypatch.setattr('ros2_control_center.main_window.available_dependencies', lambda: ('std_msgs',))
+    monkeypatch.setattr('ros2_control_center.main_window.create_package', fake_create)
+    monkeypatch.setattr('ros2_control_center.main_window.list_packages', lambda path: tuple(packages))
+    monkeypatch.setattr('ros2_control_center.main_window.list_executables',
+                        lambda path, name: ('hello_node',))
+    monkeypatch.setattr('ros2_control_center.main_window.run_process_command',
+                        lambda path, name, executable: ('python3', '-c', "print('node started')"))
+    monkeypatch.setattr(QDialog, 'exec_', accept_create_dialog)
+    try:
+        instance.workspace_path.setText(str(workspace))
+        instance.create_button.click()
+        instance.create_package_button.click()
+        assert instance.package_combo.currentData() == 'my_robot'
+        assert 'my_robot' in instance.package_create_summary.text()
+        assert launched[-1][-1] == str(workspace / 'src' / 'my_robot' / 'src' / 'hello_node.cpp')
+        instance.open_code_button.click()
+        assert launched[-1][-1] == str(workspace / 'src' / 'my_robot' / 'src' / 'hello_node.cpp')
+        monkeypatch.setattr(QFileDialog, 'getOpenFileName',
+                            lambda *args: (str(workspace / 'src' / 'my_robot' / 'src' / 'hello_node.cpp'),
+                                           'ROS 源码'))
+        instance.choose_source_button.click()
+        assert launched[-1][-1] == str(workspace / 'src' / 'my_robot' / 'src' / 'hello_node.cpp')
+        instance.build_button.click()
+        assert launched[-1] == WorkspaceManager.build_terminal_command(workspace)
+        instance.refresh_executables_button.click()
+        assert instance.run_node_button.isEnabled()
+        instance.run_node_button.click()
+        assert pump(qt_app, lambda: 'node started' in '\n'.join(
+            instance.node_output.item(i).text() for i in range(instance.node_output.count())))
+        assert pump(qt_app, lambda: instance.node_process.state() == QProcess.NotRunning)
+        assert '退出码 0' in instance.guide_status.text()
+    finally:
+        instance.request_close('detach')
+        instance.close()
+
+
+def test_stop_node_button_ends_managed_process(qt_app, manager, monkeypatch, tmp_path):
+    workspace = tmp_path / 'ws'
+    WorkspaceManager.create(workspace)
+    source = workspace / 'src' / 'demo' / 'demo' / 'hello_node.py'
+    source.parent.mkdir(parents=True)
+    source.write_text('pass', encoding='utf-8')
+    info = PackageInfo('demo', 'ament_python', source.parent.parent, source, 'hello_node')
+    monkeypatch.setattr('ros2_control_center.main_window.list_packages', lambda path: (info,))
+    monkeypatch.setattr('ros2_control_center.main_window.list_executables',
+                        lambda path, name: ('hello_node',))
+    monkeypatch.setattr('ros2_control_center.main_window.run_process_command',
+                        lambda *args: ('python3', '-u', '-c',
+                                      "import time; print('running'); time.sleep(30)"))
+    instance = MainWindow(manager=manager,
+                          recent_workspaces=RecentWorkspaces(tmp_path / 'workspaces.json'))
+    try:
+        instance.workspace_path.setText(str(workspace))
+        instance.refresh_packages()
+        instance.run_node_button.click()
+        assert pump(qt_app, lambda: instance.node_process.state() == QProcess.Running)
+        assert instance.stop_node_button.isEnabled()
+        old_generation = instance._node_run_generation
+        instance.stop_node_button.click()
+        assert pump(qt_app, lambda: instance.node_process.state() == QProcess.NotRunning)
+        assert instance.run_node_button.isEnabled()
+        assert '节点已停止' in instance.guide_status.text()
+        instance.run_node_button.click()
+        assert pump(qt_app, lambda: instance.node_process.state() == QProcess.Running)
+        instance._kill_node_if_needed(old_generation)
+        assert instance.node_process.state() == QProcess.Running
+        instance.stop_node_button.click()
+        assert pump(qt_app, lambda: instance.node_process.state() == QProcess.NotRunning)
+    finally:
+        instance.request_close('detach')
+        instance.close()
 
 
 def test_close_cancel_preserves_running_process_and_polling(window, manager):

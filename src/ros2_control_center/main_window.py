@@ -7,7 +7,8 @@ from typing import Callable, Literal
 from PyQt5.QtCore import QProcess, QTimer, Qt, QUrl, pyqtSignal
 from PyQt5.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PyQt5.QtWidgets import (
-    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton,
     QScrollArea, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -16,6 +17,12 @@ from .catalog import ToolSpec, default_catalog, validate_tool
 from .process_manager import ProcessManager, ProcessRecord, ProcessState
 from .ros_graph import GraphKind, GraphResult, RosGraphWorker
 from .workspace import WorkspaceManager
+from .guided_workflow import (
+    ROS_ENVIRONMENT_LABEL, RecentWorkspaces, available_dependencies,
+    create_code_folder, create_package, editor_command,
+    list_executables, list_packages, run_process_command, topic_terminal_command,
+    validate_code_folder,
+)
 
 
 _STATE_LABELS = {
@@ -120,6 +127,7 @@ class MainWindow(QMainWindow):
         manager: ProcessManager | None = None,
         *,
         workspace_manager: WorkspaceManager | None = None,
+        recent_workspaces: RecentWorkspaces | None = None,
         graph_workers: dict[GraphKind, RosGraphWorker] | None = None,
         command_launcher: Callable[[tuple[str, ...]], bool] | None = None,
         parent: QWidget | None = None,
@@ -131,6 +139,10 @@ class MainWindow(QMainWindow):
         self._closing_when_stopped = False
         self._closed = False
         self._last_records: dict[str, ProcessRecord] = {}
+        self.recent_workspaces = recent_workspaces if recent_workspaces is not None else RecentWorkspaces()
+        self._packages = {}
+        self.code_folder: Path | None = None
+        self._folder_workspace: Path | None = None
         self.setWindowTitle('ROS 2 控制中心')
         self.setAccessibleName('ROS 2 控制中心')
         self.resize(1000, 940)
@@ -161,6 +173,16 @@ class MainWindow(QMainWindow):
         self.stop_all_button.clicked.connect(self.stop_all)
         self.log_folder_button.clicked.connect(self.open_log_folder)
 
+        self._build_workspace(root)
+        self.node_process = QProcess(self)
+        self.node_process.setProcessChannelMode(QProcess.MergedChannels)
+        self.node_process.readyReadStandardOutput.connect(self._read_node_output)
+        self.node_process.finished.connect(self._node_finished)
+        self.node_process.errorOccurred.connect(self._node_error)
+        self._node_output_buffer = ''
+        self._stopping_node = False
+        self._node_run_generation = 0
+        root.addWidget(QLabel('常用 ROS 2 工具'))
         self.cards: dict[str, ToolCard] = {}
         grid = QGridLayout()
         records = self.manager.poll()
@@ -178,7 +200,6 @@ class MainWindow(QMainWindow):
                 card.dependency_button.setText(f'启动{dependencies}')
                 card.dependency_button.setAccessibleName(f'为{record.spec.title}启动{dependencies}')
         root.addLayout(grid)
-        self._build_workspace(root)
         self.graph_tabs = QTabWidget()
         self.graph_tabs.setAccessibleName('ROS 图检查页签')
         self.graph_buttons: dict[GraphKind, QPushButton] = {}
@@ -215,6 +236,7 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(container)
         self.setCentralWidget(scroll)
+        self.refresh_packages()
         self._set_environment_status()
         self._update_records(records)
         self.process_timer = QTimer(self)
@@ -223,40 +245,152 @@ class MainWindow(QMainWindow):
         self.process_timer.start()
 
     def _build_workspace(self, root: QVBoxLayout) -> None:
-        group = QGroupBox('工作空间')
+        group = QGroupBox('按顺序操作：工作空间 → 功能包 → 写代码 → 构建 → 运行')
         layout = QVBoxLayout(group)
+        heading = QHBoxLayout()
+        instruction = QLabel('只需自己写具体 ROS 2 代码；其余步骤可用下面的按钮完成。')
+        instruction.setWordWrap(True)
+        heading.addWidget(instruction, 1)
+        self.help_button = _button('使用说明', '查看 ROS 2 工作空间按钮使用说明', 'help-about')
+        heading.addWidget(self.help_button)
+        layout.addLayout(heading)
+
+        layout.addWidget(QLabel('第 1 步 · 选择或创建工作空间'))
+        recent_row = QHBoxLayout()
+        recent_row.addWidget(QLabel('已用过：'))
+        self.recent_workspace_combo = QComboBox()
+        self.recent_workspace_combo.setAccessibleName('已用过的 ROS 工作空间')
+        recent_row.addWidget(self.recent_workspace_combo, 1)
+        layout.addLayout(recent_row)
         path_row = QHBoxLayout()
         path_label = QLabel('路径：')
         self.workspace_path = QLineEdit(str(Path.home() / 'ros2_ws'))
         self.workspace_path.setAccessibleName('ROS 工作空间路径')
         path_label.setBuddy(self.workspace_path)
-        self.browse_button = _button('浏览…', '浏览选择工作空间', 'folder-open')
+        self.browse_button = _button('选择工作空间…', '在窗口中选择工作空间', 'folder-open')
         path_row.addWidget(path_label)
         path_row.addWidget(self.workspace_path, 1)
         path_row.addWidget(self.browse_button)
         layout.addLayout(path_row)
         actions = QHBoxLayout()
         self.create_button = _button('创建工作空间', '创建 ROS 工作空间', 'folder-new')
+        self.new_workspace_button = _button('按名称新建…', '输入名字创建新的 ROS 工作空间', 'folder-new')
         self.open_button = _button('打开文件夹', '打开工作空间文件夹', 'folder-open')
         self.build_button = _button('在终端构建', '在独立终端构建工作空间', 'utilities-terminal')
-        for button in (self.create_button, self.open_button, self.build_button):
+        for button in (self.create_button, self.new_workspace_button,
+                       self.open_button, self.build_button):
             actions.addWidget(button)
         actions.addStretch()
         layout.addLayout(actions)
+
+        layout.addWidget(QLabel('第 2 步 · 选择写代码的文件夹；可弹窗输入名称创建新文件夹'))
+        folder_row = QHBoxLayout()
+        self.code_folder_label = QLabel('先选择或创建工作空间')
+        self.code_folder_label.setAccessibleName('当前写代码的文件夹')
+        self.code_folder_label.setWordWrap(True)
+        folder_row.addWidget(self.code_folder_label, 1)
+        self.choose_code_folder_button = _button('选择文件夹…', '在窗口中选择写代码的文件夹', 'folder-open')
+        folder_row.addWidget(self.choose_code_folder_button)
+        self.create_folder_button = _button('创建文件夹…', '输入名称并创建写代码的文件夹', 'folder-new')
+        folder_row.addWidget(self.create_folder_button)
+        self.open_code_folder_button = _button('打开此文件夹', '用 VS Code 打开当前写代码的文件夹', 'accessories-text-editor')
+        folder_row.addWidget(self.open_code_folder_button)
+        layout.addLayout(folder_row)
+
+        layout.addWidget(QLabel('第 3 步 · 设置 ROS 环境、语言和库，在选定文件夹中创建功能包'))
+        package_create_row = QHBoxLayout()
+        self.package_create_summary = QLabel('点击右侧按钮，在弹窗中填写包名、选择 Python/C++ 和所需库。')
+        self.package_create_summary.setWordWrap(True)
+        package_create_row.addWidget(self.package_create_summary, 1)
+        self.create_package_button = _button('设置并创建功能包…', '设置语言和库并创建功能包', 'folder-new')
+        package_create_row.addWidget(self.create_package_button)
+        layout.addLayout(package_create_row)
+
+        layout.addWidget(QLabel('第 4 步 · 选择源码文件后自动打开 VS Code，编辑并保存'))
+        package_select_row = QHBoxLayout()
+        self.package_combo = QComboBox()
+        self.package_combo.setAccessibleName('当前工作空间功能包')
+        package_select_row.addWidget(self.package_combo, 1)
+        self.refresh_packages_button = _button('刷新功能包', '刷新当前工作空间功能包列表', 'view-refresh')
+        package_select_row.addWidget(self.refresh_packages_button)
+        self.open_code_button = _button('编辑选中包源码', '用 VS Code 打开所选功能包代码', 'accessories-text-editor')
+        package_select_row.addWidget(self.open_code_button)
+        self.choose_source_button = _button('选择源码文件…', '选择源码文件并立即在 VS Code 打开', 'document-open')
+        package_select_row.addWidget(self.choose_source_button)
+        layout.addLayout(package_select_row)
+        self.package_detail = QLabel('先创建或选择一个功能包。')
+        self.package_detail.setAccessibleName('所选功能包代码位置')
+        self.package_detail.setWordWrap(True)
+        layout.addWidget(self.package_detail)
+
+        layout.addWidget(QLabel('第 5 步 · 保存代码后点击“在终端构建”，等终端显示构建成功'))
+        layout.addWidget(QLabel('第 6 步 · 刷新可运行节点，选择后运行；输出在下方，可点击“停止节点”'))
+        run_row = QHBoxLayout()
+        self.executable_combo = QComboBox()
+        self.executable_combo.setAccessibleName('所选功能包的可运行节点')
+        run_row.addWidget(self.executable_combo, 1)
+        self.refresh_executables_button = _button('刷新可运行节点', '刷新已构建的可运行节点', 'view-refresh')
+        run_row.addWidget(self.refresh_executables_button)
+        self.run_node_button = _button('运行节点', '在控制中心运行所选 ROS 2 节点', 'media-playback-start')
+        run_row.addWidget(self.run_node_button)
+        self.stop_node_button = _button('停止节点', '停止由控制中心运行的 ROS 2 节点', 'media-playback-stop')
+        self.stop_node_button.setEnabled(False)
+        run_row.addWidget(self.stop_node_button)
+        layout.addLayout(run_row)
+        self.node_output = QListWidget()
+        self.node_output.setAccessibleName('当前运行节点的输出')
+        self.node_output.setMaximumHeight(110)
+        self.node_output.addItem('节点输出会显示在这里。')
+        layout.addWidget(self.node_output)
+
+        layout.addWidget(QLabel('第 7 步 · 如需查看消息，输入话题名并点击“查看话题”'))
+        topic_row = QHBoxLayout()
+        self.topic_input = QLineEdit()
+        self.topic_input.setPlaceholderText('例如 /chatter（先运行发布这个话题的节点）')
+        self.topic_input.setAccessibleName('要查看的 ROS 2 话题名称')
+        topic_row.addWidget(self.topic_input, 1)
+        self.topic_button = _button('查看话题', '在独立终端查看 ROS 2 话题消息', 'utilities-terminal')
+        topic_row.addWidget(self.topic_button)
+        layout.addLayout(topic_row)
+
         self.workspace_note = QLabel('打开与构建为独立外部操作，不受“停止全部”控制。')
         self.workspace_note.setWordWrap(True)
         layout.addWidget(self.workspace_note)
+        self.guide_status = QLabel('准备就绪：先选择或创建工作空间。')
+        self.guide_status.setAccessibleName('工作空间操作步骤与结果')
+        self.guide_status.setWordWrap(True)
+        layout.addWidget(self.guide_status)
         root.addWidget(group)
+        self._refresh_recent_workspaces()
+        self.help_button.clicked.connect(self.show_workspace_help)
+        self.recent_workspace_combo.activated.connect(self.select_recent_workspace)
         self.browse_button.clicked.connect(self.browse_workspace)
+        self.choose_code_folder_button.clicked.connect(self.choose_code_folder)
+        self.create_folder_button.clicked.connect(self.create_code_folder_dialog)
+        self.open_code_folder_button.clicked.connect(self.open_selected_code_folder)
         self.create_button.clicked.connect(self.create_workspace)
+        self.new_workspace_button.clicked.connect(self.new_workspace_dialog)
         self.open_button.clicked.connect(lambda: self._workspace_command('open'))
         self.build_button.clicked.connect(lambda: self._workspace_command('build'))
+        self.workspace_path.editingFinished.connect(self.refresh_packages)
+        self.create_package_button.clicked.connect(self.show_create_package_dialog)
+        self.refresh_packages_button.clicked.connect(self.refresh_packages)
+        self.package_combo.currentIndexChanged.connect(self._on_package_selected)
+        self.open_code_button.clicked.connect(self.open_package_code)
+        self.choose_source_button.clicked.connect(self.choose_source_file)
+        self.refresh_executables_button.clicked.connect(self.refresh_executables)
+        self.run_node_button.clicked.connect(self.run_selected_node)
+        self.stop_node_button.clicked.connect(self.stop_selected_node)
+        self.topic_button.clicked.connect(self.view_topic)
 
     def _set_environment_status(self) -> None:
         errors = tuple(dict.fromkeys(error for spec in default_catalog() for error in validate_tool(spec)))
-        if errors:
-            self.environment_label.setText('ROS 2 Humble 环境不完整：' + '；'.join(errors))
-            self.log_event('环境检查：' + '；'.join(errors))
+        if not Path('/opt/ros/humble/setup.bash').is_file():
+            self.environment_label.setText('ROS 2 Humble 环境未就绪：找不到 /opt/ros/humble/setup.bash')
+            self.log_event('ROS 2 Humble 环境未就绪')
+        elif errors:
+            self.environment_label.setText('ROS 2 Humble 工作环境已就绪；部分常用工具不可用：' + '；'.join(errors))
+            self.log_event('部分常用工具不可用：' + '；'.join(errors))
         else:
             self.environment_label.setText('ROS 2 Humble · 环境配置已就绪')
 
@@ -321,6 +455,12 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(self, '选择工作空间目录', self.workspace_path.text())
         if selected:
             self.workspace_path.setText(selected)
+            self.refresh_packages()
+            if WorkspaceManager.is_workspace(Path(selected)):
+                self._remember_workspace(Path(selected))
+                self.guide_status.setText(f'已选择工作空间：{selected}。现在选择写代码的文件夹。')
+            else:
+                self.guide_status.setText('这个目录还不是 ROS 工作空间；如果它是空目录，可点击“创建工作空间”。')
 
     def _workspace_path(self) -> Path:
         text = self.workspace_path.text().strip()
@@ -336,8 +476,27 @@ class MainWindow(QMainWindow):
             elif result.ready:
                 verb = '已创建' if result.created else '已就绪'
                 self.log_event(f'工作空间{verb}：{result.path}')
+                self._remember_workspace(result.path)
+                self.refresh_packages()
+                self.guide_status.setText(f'第 1 步完成：{result.path}。现在选择或创建写代码的文件夹。')
         except (OSError, ValueError) as exc:
             self.log_event(f'工作空间操作失败：{exc}')
+
+    def new_workspace_dialog(self) -> None:
+        try:
+            parent = self._workspace_path().parent
+            name, accepted = QInputDialog.getText(
+                self, '按名称新建工作空间', f'在 {parent} 下新建工作空间，请输入名称：')
+            if not accepted:
+                return
+            name = name.strip()
+            if not name or name in {'.', '..'} or '/' in name or '\x00' in name:
+                raise ValueError('请输入一个文件夹名称，不要输入路径或斜杠')
+            self.workspace_path.setText(str(parent / name))
+            self.create_workspace()
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'新建工作空间失败：{exc}')
+            self.log_event(f'新建工作空间失败：{exc}')
 
     def _workspace_command(self, action: str) -> None:
         try:
@@ -350,10 +509,358 @@ class MainWindow(QMainWindow):
                 success = f'已在独立终端请求构建：{path}；请在终端查看构建结果'
             if self._launch(command):
                 self.log_event(success)
+                self._remember_workspace(path)
             else:
                 self.log_event('工作空间操作启动失败：请检查文件管理器或终端是否可用')
         except (OSError, ValueError) as exc:
             self.log_event(f'工作空间操作失败：{exc}')
+
+    def _refresh_recent_workspaces(self) -> None:
+        self.recent_workspace_combo.blockSignals(True)
+        self.recent_workspace_combo.clear()
+        self.recent_workspace_combo.addItem('选择已用过的工作空间', None)
+        for path in self.recent_workspaces.list():
+            self.recent_workspace_combo.addItem(str(path), str(path))
+        self.recent_workspace_combo.blockSignals(False)
+
+    def _remember_workspace(self, path: Path) -> None:
+        try:
+            self.recent_workspaces.add(path)
+            self._refresh_recent_workspaces()
+        except OSError as exc:
+            self.log_event(f'无法保存工作空间列表：{exc}')
+
+    def select_recent_workspace(self, index: int) -> None:
+        path = self.recent_workspace_combo.itemData(index)
+        if path:
+            self.workspace_path.setText(path)
+            self.refresh_packages()
+            self.guide_status.setText(f'已切换工作空间：{path}。请选择该空间中的功能包。')
+
+    def refresh_packages(self) -> None:
+        previous = self.package_combo.currentData()
+        self.package_combo.blockSignals(True)
+        self.package_combo.clear()
+        self._packages = {}
+        ready = False
+        try:
+            workspace = self._workspace_path()
+            if WorkspaceManager.is_workspace(workspace):
+                ready = True
+                if self._folder_workspace != workspace or self.code_folder is None:
+                    self.code_folder = workspace / 'src'
+                else:
+                    try:
+                        self.code_folder = validate_code_folder(workspace, self.code_folder)
+                    except ValueError:
+                        self.code_folder = workspace / 'src'
+                self._folder_workspace = workspace
+                packages = list_packages(workspace)
+                self._packages = {info.name: info for info in packages}
+                for info in packages:
+                    self.package_combo.addItem(info.name, info.name)
+                if previous in self._packages:
+                    self.package_combo.setCurrentIndex(self.package_combo.findData(previous))
+        except (OSError, ValueError):
+            pass
+        if not ready:
+            self.code_folder = None
+            self._folder_workspace = None
+        self.code_folder_label.setText(
+            f'当前写代码位置：{self.code_folder}' if self.code_folder else '先选择或创建工作空间')
+        for button in (self.choose_code_folder_button, self.create_folder_button,
+                       self.open_code_folder_button):
+            button.setEnabled(ready)
+        self.package_combo.blockSignals(False)
+        self._on_package_selected()
+
+    def _selected_code_folder(self) -> Path:
+        if self.code_folder is None:
+            raise ValueError('先选择或创建工作空间')
+        return validate_code_folder(self._workspace_path(), self.code_folder)
+
+    def choose_code_folder(self) -> None:
+        try:
+            current = self._selected_code_folder()
+            selected = QFileDialog.getExistingDirectory(self, '选择写代码的文件夹', str(current))
+            if not selected:
+                return
+            self.code_folder = validate_code_folder(self._workspace_path(), Path(selected))
+            self.code_folder_label.setText(f'当前写代码位置：{self.code_folder}')
+            self.guide_status.setText(f'已选择文件夹：{self.code_folder}。可以在这里创建功能包。')
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'选择文件夹失败：{exc}')
+            self.log_event(f'选择文件夹失败：{exc}')
+
+    def create_code_folder_dialog(self) -> None:
+        try:
+            parent = self._selected_code_folder()
+            name, accepted = QInputDialog.getText(
+                self, '创建写代码的文件夹', f'在 {parent} 中创建文件夹，请输入名称：')
+            if not accepted:
+                return
+            folder = create_code_folder(self._workspace_path(), parent, name.strip())
+            self.code_folder = folder
+            self.code_folder_label.setText(f'当前写代码位置：{folder}')
+            self.guide_status.setText(f'第 2 步完成：已创建并选中 {folder}。现在选择 Python 或 C++ 创建功能包。')
+            self.log_event(f'已创建代码文件夹：{folder}')
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.guide_status.setText(f'创建文件夹失败：{exc}')
+            self.log_event(f'创建文件夹失败：{exc}')
+
+    def open_selected_code_folder(self) -> None:
+        try:
+            folder = self._selected_code_folder()
+            if self._launch(('code', '--reuse-window', str(folder))):
+                self.guide_status.setText(f'已请求在 VS Code 打开：{folder}')
+                self.log_event(f'已请求打开文件夹：{folder}')
+            else:
+                self.guide_status.setText('VS Code 启动失败，请检查是否已安装 code 命令。')
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'打开文件夹失败：{exc}')
+            self.log_event(f'打开文件夹失败：{exc}')
+
+    def _selected_package(self):
+        return self._packages.get(self.package_combo.currentData())
+
+    def _on_package_selected(self) -> None:
+        info = self._selected_package()
+        self.open_code_button.setEnabled(info is not None)
+        if info is None:
+            self.package_detail.setText('当前路径下还没有功能包。先创建工作空间和功能包。')
+        else:
+            self.package_detail.setText(f'代码位置：{info.source_file}。打开后只需修改代码并保存。')
+        self.refresh_executables()
+
+    def show_create_package_dialog(self) -> None:
+        try:
+            workspace = self._workspace_path()
+            folder = self._selected_code_folder()
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'请先选择工作空间和写代码的文件夹：{exc}')
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('设置并创建 ROS 2 功能包')
+        dialog.setAccessibleName('设置功能包环境语言与库')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f'工作空间：{workspace}'))
+        layout.addWidget(QLabel(f'创建位置：{folder}'))
+        layout.addWidget(QLabel('ROS 环境：'))
+        environment_combo = QComboBox()
+        environment_combo.setAccessibleName('ROS 2 环境')
+        environment_combo.addItem(ROS_ENVIRONMENT_LABEL)
+        layout.addWidget(environment_combo)
+        layout.addWidget(QLabel('当前系统只配置了上面的 ROS 2 环境。'))
+        layout.addWidget(QLabel('功能包名称（小写字母开头，可用数字和下划线）：'))
+        name_input = QLineEdit()
+        name_input.setAccessibleName('新功能包名称')
+        name_input.setPlaceholderText('例如 my_robot')
+        layout.addWidget(name_input)
+        layout.addWidget(QLabel('编写语言：'))
+        language_combo = QComboBox()
+        language_combo.setAccessibleName('功能包编写语言')
+        language_combo.addItem('Python（ament_python）', 'python')
+        language_combo.addItem('C++（ament_cmake）', 'cpp')
+        layout.addWidget(language_combo)
+        layout.addWidget(QLabel('需要的 ROS 库（可多选；核心 rclpy/rclcpp 自动添加）：'))
+        explanations = {
+            'std_msgs': '基础消息', 'geometry_msgs': '位置与速度',
+            'sensor_msgs': '传感器', 'nav_msgs': '导航', 'tf2_ros': '坐标变换',
+        }
+        checks = {}
+        for dependency in available_dependencies():
+            choice = QCheckBox(f'{dependency} · {explanations.get(dependency, "ROS 库")}')
+            choice.setAccessibleName(f'导入 {dependency}')
+            layout.addWidget(choice)
+            checks[dependency] = choice
+        if not checks:
+            layout.addWidget(QLabel('未找到可选的常用 ROS 库；仍可创建基础功能包。'))
+        layout.addWidget(QLabel('确认后会写入功能包依赖，并在示例源码加入所选库的导入。'))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText('创建功能包')
+        buttons.button(QDialogButtonBox.Cancel).setText('取消')
+        for button in buttons.buttons():
+            button.setAccessibleName(button.text())
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        name_input.setFocus()
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        dependencies = tuple(name for name, choice in checks.items() if choice.isChecked())
+        self.create_guided_package(name_input.text().strip(), language_combo.currentData(), dependencies)
+
+    def create_guided_package(self, name: str, language: str,
+                              dependencies: tuple[str, ...] = ()) -> None:
+        self.create_package_button.setEnabled(False)
+        self.guide_status.setText('正在创建功能包…')
+        QApplication.processEvents()
+        try:
+            workspace = self._workspace_path()
+            info = create_package(workspace, name, language,
+                                  self._selected_code_folder(), dependencies)
+            self._remember_workspace(workspace)
+            self.refresh_packages()
+            index = self.package_combo.findData(info.name)
+            if index >= 0:
+                self.package_combo.setCurrentIndex(index)
+            self.guide_status.setText(f'第 3 步完成：{info.name} 已创建，正在 VS Code 打开示例源码。')
+            self.package_create_summary.setText(
+                f'已创建 {name}（{language.upper()}；库：{", ".join(dependencies) or "仅核心库"}）')
+            self.log_event(f'已创建 {language.upper()} 功能包：{info.path}')
+            self.open_package_code()
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.guide_status.setText(f'创建功能包失败：{exc}')
+            self.log_event(f'创建功能包失败：{exc}')
+        finally:
+            self.create_package_button.setEnabled(True)
+
+    def open_package_code(self) -> None:
+        info = self._selected_package()
+        if info is None:
+            self.guide_status.setText('先选择功能包，再打开代码。')
+            return
+        try:
+            if self._launch(editor_command(info)):
+                self.guide_status.setText(f'已请求在 VS Code 打开 {info.source_file}。修改后保存，再点击“在终端构建”。')
+                self.log_event(f'已请求打开代码：{info.source_file}')
+            else:
+                self.guide_status.setText('VS Code 启动失败，请检查是否已安装 code 命令。')
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'打开代码失败：{exc}')
+            self.log_event(f'打开代码失败：{exc}')
+
+    def choose_source_file(self) -> None:
+        try:
+            folder = self._selected_code_folder()
+            selected, _filter = QFileDialog.getOpenFileName(
+                self, '选择要编写的源码文件', str(folder),
+                'ROS 源码 (*.py *.cpp *.cc *.cxx *.hpp *.h);;所有文件 (*)')
+            if not selected:
+                return
+            source = Path(selected)
+            validate_code_folder(self._workspace_path(), source.parent)
+            if not source.is_file() or source.is_symlink():
+                raise ValueError('请选择当前工作空间 src 内的普通源码文件')
+            if self._launch(('code', '--reuse-window', str(source))):
+                self.guide_status.setText(f'已请求在 VS Code 打开：{source}。保存后点击“在终端构建”。')
+                self.log_event(f'已请求打开源码文件：{source}')
+            else:
+                self.guide_status.setText('VS Code 启动失败，请检查是否已安装 code 命令。')
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'选择源码文件失败：{exc}')
+            self.log_event(f'选择源码文件失败：{exc}')
+
+    def refresh_executables(self) -> None:
+        previous = self.executable_combo.currentText()
+        self.executable_combo.clear()
+        info = self._selected_package()
+        if info is not None:
+            try:
+                for executable in list_executables(self._workspace_path(), info.name):
+                    self.executable_combo.addItem(executable)
+            except (OSError, ValueError) as exc:
+                self.log_event(f'刷新可运行节点失败：{exc}')
+        index = self.executable_combo.findText(previous)
+        if index >= 0:
+            self.executable_combo.setCurrentIndex(index)
+        running = hasattr(self, 'node_process') and self.node_process.state() != QProcess.NotRunning
+        self.run_node_button.setEnabled(self.executable_combo.count() > 0 and not running)
+        self.stop_node_button.setEnabled(running)
+
+    def run_selected_node(self) -> None:
+        info = self._selected_package()
+        executable = self.executable_combo.currentText()
+        if info is None or not executable:
+            self.guide_status.setText('先构建功能包，再点击“刷新可运行节点”并选择节点。')
+            return
+        if self.node_process.state() != QProcess.NotRunning:
+            self.guide_status.setText('已有节点正在运行；请先点击“停止节点”。')
+            return
+        try:
+            command = run_process_command(self._workspace_path(), info.name, executable)
+            self.node_output.clear()
+            self._node_output_buffer = ''
+            self._stopping_node = False
+            self._node_run_generation += 1
+            self.node_process.start(command[0], list(command[1:]))
+            self.guide_status.setText(f'正在启动 {info.name}/{executable}；输出会显示在下方。')
+            self.log_event(f'正在启动节点：{info.name}/{executable}')
+            self.run_node_button.setEnabled(False)
+            self.stop_node_button.setEnabled(True)
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'运行节点失败：{exc}')
+            self.log_event(f'运行节点失败：{exc}')
+
+    def _read_node_output(self) -> None:
+        chunk = bytes(self.node_process.readAllStandardOutput()).decode('utf-8', errors='replace')
+        self._node_output_buffer += chunk
+        while '\n' in self._node_output_buffer:
+            line, self._node_output_buffer = self._node_output_buffer.split('\n', 1)
+            if line.strip():
+                self.node_output.addItem(line.rstrip())
+        while self.node_output.count() > 150:
+            self.node_output.takeItem(0)
+        self.node_output.scrollToBottom()
+
+    def _node_finished(self, exit_code: int, _status) -> None:
+        self._read_node_output()
+        if self._node_output_buffer.strip():
+            self.node_output.addItem(self._node_output_buffer.rstrip())
+        self._node_output_buffer = ''
+        result = '节点已停止。' if self._stopping_node else f'节点已结束（退出码 {exit_code}）。'
+        self.guide_status.setText(result + '可以修改代码后重新构建运行。')
+        self.log_event(result)
+        self._stopping_node = False
+        self.refresh_executables()
+
+    def _node_error(self, _error) -> None:
+        if self._stopping_node:
+            return
+        self.guide_status.setText(f'启动节点失败：{self.node_process.errorString()}')
+        self.log_event(f'启动节点失败：{self.node_process.errorString()}')
+        self.refresh_executables()
+
+    def stop_selected_node(self) -> None:
+        if self.node_process.state() == QProcess.NotRunning:
+            return
+        self._stopping_node = True
+        self.node_process.terminate()
+        self.guide_status.setText('正在停止节点…')
+        generation = self._node_run_generation
+        QTimer.singleShot(3000, lambda: self._kill_node_if_needed(generation))
+
+    def _kill_node_if_needed(self, generation: int) -> None:
+        if (generation == self._node_run_generation
+                and self.node_process.state() != QProcess.NotRunning):
+            self.node_process.kill()
+
+    def view_topic(self) -> None:
+        try:
+            topic = self.topic_input.text().strip()
+            command = topic_terminal_command(self._workspace_path(), topic)
+            if self._launch(command):
+                self.guide_status.setText(f'已请求查看 {topic}。先运行发布该话题的节点；在终端按 Ctrl+C 停止查看。')
+                self.log_event(f'已请求查看话题：{topic}')
+            else:
+                self.guide_status.setText('话题终端启动失败，请检查 GNOME Terminal。')
+        except (OSError, ValueError) as exc:
+            self.guide_status.setText(f'查看话题失败：{exc}')
+            self.log_event(f'查看话题失败：{exc}')
+
+    def show_workspace_help(self) -> None:
+        QMessageBox.information(
+            self, '工作空间按钮使用说明',
+            '1. 工作空间：点“按名称新建…”可弹窗输入名字创建；已有空间从“已用过”下拉框选，或点“选择工作空间…”打开选择窗口。也可手填路径并点“创建工作空间”。'
+            '\n2. 写代码位置：点“选择文件夹…”挑选当前工作空间 src 内的文件夹；或点“创建文件夹…”，在弹窗输入名字并确定。新文件夹会自动选中。'
+            '\n3. 功能包：点“设置并创建功能包…”，在弹窗输入小写包名，选择 Python 或 C++，勾选要用的 ROS 库，然后点“创建功能包”。当前系统使用 ROS 2 Humble。'
+            '\n4. 新建包后会自动在 VS Code 打开示例源码。以后可点“选择源码文件…”挑选文件，选中后会立即打开 VS Code；也可点“编辑选中包源码”。'
+            '\n5. 点“在终端构建”；等待终端显示 Summary 成功，失败则先修正代码。'
+            '\n6. 点“刷新可运行节点”，选中节点，再点“运行节点”；输出显示在窗口中，可点“停止节点”。'
+            '\n7. 要看话题消息，先运行发布该话题的节点，输入话题名并点“查看话题”。'
+            '\n每个工作空间独立；切换工作空间后，文件夹与功能包选择也会同步切换。'
+            '\n关闭控制中心会停止由本窗口运行的节点。“停止全部”仅管理上方常用工具；文件夹、构建和话题终端独立运行。',
+        )
 
     def refresh_graph(self, kind: GraphKind) -> None:
         if self._closed:
@@ -408,6 +915,9 @@ class MainWindow(QMainWindow):
             self.close()
 
     def _finish_close(self) -> bool:
+        if self.node_process.state() != QProcess.NotRunning:
+            self.node_process.kill()
+            self.node_process.waitForFinished(1000)
         self._closed = True
         self.process_timer.stop()
         for worker in self.graph_workers.values():
