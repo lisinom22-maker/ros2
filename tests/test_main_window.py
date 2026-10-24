@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt, QProcess, QTimer
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QInputDialog, QLineEdit, QMessageBox, QPushButton,
+    QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
 )
 
 from ros2_control_center import app as application
@@ -242,6 +242,13 @@ def test_workspace_default_and_idempotent_create_use_manager(window, tmp_path):
     assert keep.stat().st_mtime_ns == before
     assert '已创建' in events(window)
     assert '已就绪' in events(window)
+
+
+def test_workspace_main_view_is_compact_and_help_remains_available(window):
+    visible = [label.text() for label in window.findChildren(QLabel) if label.isVisible()]
+    assert not any(text.startswith('第 ') and '步' in text for text in visible)
+    assert not window.workspace_note.isVisible()
+    assert window.help_button.isVisible()
 
 
 def test_workspace_refusal_and_open_build_errors_are_logged(window, tmp_path):
