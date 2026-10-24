@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ROS2 控制中心
+Comment=管理 ROS 2 Humble 工具、工作空间和 ROS 图
+Exec=/home/lisinom/.local/bin/ros2-control-center
+Icon=applications-system
+Terminal=false
+StartupNotify=true
+Categories=Development;
